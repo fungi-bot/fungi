@@ -9,10 +9,10 @@ use anyhow::{Result, bail};
 use async_result::{AsyncResult, Completer};
 use fungi_util::protocols::{FUNGI_PEER_HANDSHAKE_PROTOCOL, FUNGI_RELAY_HANDSHAKE_PROTOCOL};
 use libp2p::{
-    Multiaddr, PeerId, Stream, StreamProtocol, Swarm,
+    Multiaddr, PeerId, Stream, StreamProtocol, Swarm, dcutr,
     futures::{AsyncReadExt, AsyncWriteExt, StreamExt},
     identity::Keypair,
-    mdns,
+    identify, mdns,
     multiaddr::Protocol,
     noise, relay,
     swarm::{
@@ -139,6 +139,40 @@ pub struct SelectedConnection {
     pub last_rtt: Option<Duration>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PeerConnectionSummary {
+    total_count: usize,
+    direct_count: usize,
+    relay_count: usize,
+    inbound_count: usize,
+    outbound_count: usize,
+    direct_addrs: Vec<Multiaddr>,
+    relay_addrs: Vec<Multiaddr>,
+}
+
+impl PeerConnectionSummary {
+    fn has_direct(&self) -> bool {
+        self.direct_count > 0
+    }
+
+    fn is_relay_only(&self) -> bool {
+        self.relay_count > 0 && self.direct_count == 0
+    }
+
+    fn log_line(&self) -> String {
+        format!(
+            "total={}, direct={}, relay={}, inbound={}, outbound={}, direct_addrs={:?}, relay_addrs={:?}",
+            self.total_count,
+            self.direct_count,
+            self.relay_count,
+            self.inbound_count,
+            self.outbound_count,
+            self.direct_addrs,
+            self.relay_addrs
+        )
+    }
+}
+
 impl SwarmControl {
     /// Create a new swarm control handle.
     pub fn new(
@@ -173,6 +207,113 @@ impl SwarmControl {
         &self.state
     }
 
+    fn peer_connection_summary(&self, peer_id: PeerId) -> PeerConnectionSummary {
+        let Some(peer_connections) = self.state.get_peer_connections(&peer_id) else {
+            return PeerConnectionSummary::default();
+        };
+
+        let mut summary = PeerConnectionSummary::default();
+
+        for conn in peer_connections.outbound() {
+            summary.total_count += 1;
+            summary.outbound_count += 1;
+            let addr = conn.multiaddr().clone();
+            if addr.to_string().contains("/p2p-circuit") {
+                summary.relay_count += 1;
+                summary.relay_addrs.push(addr);
+            } else {
+                summary.direct_count += 1;
+                summary.direct_addrs.push(addr);
+            }
+        }
+
+        for conn in peer_connections.inbound() {
+            summary.total_count += 1;
+            summary.inbound_count += 1;
+            let addr = conn.multiaddr().clone();
+            if addr.to_string().contains("/p2p-circuit") {
+                summary.relay_count += 1;
+                summary.relay_addrs.push(addr);
+            } else {
+                summary.direct_count += 1;
+                summary.direct_addrs.push(addr);
+            }
+        }
+
+        summary
+    }
+
+    async fn best_effort_direct_upgrade_dial(&self, peer_id: PeerId, reason: &'static str) {
+        let summary = self.peer_connection_summary(peer_id);
+        if summary.has_direct() {
+            log::debug!(
+                "Skip direct upgrade dial for peer {} (reason={}): already has direct connection: {}",
+                peer_id,
+                reason,
+                summary.log_line()
+            );
+            return;
+        }
+
+        if self.state.dial_callback().lock().contains_key(&peer_id) {
+            log::debug!(
+                "Skip direct upgrade dial for peer {} (reason={}): dial already in progress",
+                peer_id,
+                reason
+            );
+            return;
+        }
+
+        log::info!(
+            "Attempting best-effort direct upgrade dial to peer {} (reason={}): {}",
+            peer_id,
+            reason,
+            summary.log_line()
+        );
+
+        let dial_res = self
+            .invoke_swarm(move |swarm| {
+                let dial_opts = DialOpts::peer_id(peer_id)
+                    .condition(PeerCondition::Always)
+                    .build();
+                swarm.dial(dial_opts)
+            })
+            .await;
+
+        match dial_res {
+            Ok(Ok(())) => {
+                log::debug!(
+                    "Submitted best-effort direct upgrade dial to peer {} (reason={})",
+                    peer_id,
+                    reason
+                );
+            }
+            Ok(Err(DialError::NoAddresses)) => {
+                log::info!(
+                    "Best-effort direct upgrade dial to peer {} had no currently known direct addresses (reason={})",
+                    peer_id,
+                    reason
+                );
+            }
+            Ok(Err(e)) => {
+                log::warn!(
+                    "Best-effort direct upgrade dial to peer {} failed immediately (reason={}): {}",
+                    peer_id,
+                    reason,
+                    e
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "Failed to submit best-effort direct upgrade dial to peer {} (reason={}): {}",
+                    peer_id,
+                    reason,
+                    e
+                );
+            }
+        }
+    }
+
     /// Register acceptance of inbound streams for a protocol.
     ///
     /// This is the unified external entrypoint for inbound stream handling,
@@ -196,6 +337,24 @@ impl SwarmControl {
         self.connect(peer_id)
             .await
             .map_err(|e| anyhow::anyhow!("Connect failed: {e}"))?;
+
+        if matches!(
+            strategy,
+            ConnectionSelectionStrategy::PreferDirect
+                | ConnectionSelectionStrategy::PreferLowLatency
+        ) {
+            let summary = self.peer_connection_summary(peer_id);
+            if summary.is_relay_only() {
+                log::info!(
+                    "Peer {} is relay-only before strategy selection ({:?}). Requesting direct upgrade attempt: {}",
+                    peer_id,
+                    strategy,
+                    summary.log_line()
+                );
+                self.best_effort_direct_upgrade_dial(peer_id, "connect_with_strategy_relay_only")
+                    .await;
+            }
+        }
 
         if matches!(
             strategy,
@@ -493,10 +652,16 @@ impl SwarmControl {
         let (completer, res) = AsyncResult::new_split::<std::result::Result<(), DialError>>();
 
         let relay_addresses_state = self.relay_addresses_state.clone();
+        let state = self.state.clone();
         let dial_result = self
             .invoke_swarm(move |swarm| {
                 if swarm.is_connected(&peer_id) && !force_redial_when_connected {
-                    log::debug!("Already connected to {peer_id}");
+                    let summary = peer_connection_summary_from_state(&state, peer_id);
+                    log::debug!(
+                        "Already connected to {}. Fast-path connect returns with current summary: {}",
+                        peer_id,
+                        summary.log_line()
+                    );
                     completer.complete(Ok(()));
                     return Ok(());
                 }
@@ -520,7 +685,8 @@ impl SwarmControl {
                             // TODO: add a rendezvous server
                             // dial with relay when no mDNS addresses are available
                             log::info!(
-                                "Dialing {peer_id} with relay address {:?}",
+                                "No direct addresses available for peer {}. Falling back to relay addresses {:?}",
+                                peer_id,
                                 relay_addresses_state.iter().map(|(addr, _)| addr).collect::<Vec<_>>()
                             );
                             let mut full_addrs = Vec::new();
@@ -691,6 +857,15 @@ async fn handle_swarm_event(
                 println!("[Swarm event] NewListenAddr {address:?}");
                 handle_new_listen_addr(&swarm_control, address);
             }
+            SwarmEvent::Behaviour(FungiBehavioursEvent::Mdns(event)) => {
+                handle_mdns_behaviour_event(&swarm_control, event);
+            }
+            SwarmEvent::Behaviour(FungiBehavioursEvent::Identify(event)) => {
+                handle_identify_behaviour_event(&swarm_control, event).await;
+            }
+            SwarmEvent::Behaviour(FungiBehavioursEvent::Dcutr(event)) => {
+                handle_dcutr_behaviour_event(event);
+            }
             SwarmEvent::Behaviour(FungiBehavioursEvent::Relay(event)) => {
                 handle_relay_behaviour_event(event);
             }
@@ -716,6 +891,13 @@ async fn handle_swarm_event(
                     peer_id,
                     connection_id,
                     &endpoint,
+                );
+
+                let summary = swarm_control.peer_connection_summary(peer_id);
+                log::info!(
+                    "Peer {} connection summary after establish: {}",
+                    peer_id,
+                    summary.log_line()
                 );
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -748,10 +930,92 @@ async fn handle_swarm_event(
                     endpoint.get_remote_address(),
                 );
                 connection_state::handle_connection_closed(&swarm_control, peer_id, connection_id);
+
+                let summary = swarm_control.peer_connection_summary(peer_id);
+                log::info!(
+                    "Peer {} connection summary after close: {}",
+                    peer_id,
+                    summary.log_line()
+                );
             }
             _ => {}
         }
     }
+}
+
+fn handle_mdns_behaviour_event(swarm_control: &SwarmControl, event: mdns::Event) {
+    match event {
+        mdns::Event::Discovered(peers) => {
+            for (peer_id, addr) in peers {
+                let summary = swarm_control.peer_connection_summary(peer_id);
+                log::info!(
+                    "[Swarm event] mDNS discovered peer {} at {}. Current summary: {}",
+                    peer_id,
+                    addr,
+                    summary.log_line()
+                );
+
+                if summary.is_relay_only() && !addr.to_string().contains("/p2p-circuit") {
+                    let swarm_control_cl = swarm_control.clone();
+                    tokio::spawn(async move {
+                        swarm_control_cl
+                            .best_effort_direct_upgrade_dial(peer_id, "mdns_discovered")
+                            .await;
+                    });
+                }
+            }
+        }
+        mdns::Event::Expired(peers) => {
+            for (peer_id, addr) in peers {
+                let summary = swarm_control.peer_connection_summary(peer_id);
+                log::info!(
+                    "[Swarm event] mDNS expired peer {} at {}. Current summary: {}",
+                    peer_id,
+                    addr,
+                    summary.log_line()
+                );
+            }
+        }
+    }
+}
+
+async fn handle_identify_behaviour_event(swarm_control: &SwarmControl, event: identify::Event) {
+    match event {
+        identify::Event::Received {
+            peer_id,
+            info,
+            observed_addr,
+            ..
+        } => {
+            let summary = swarm_control.peer_connection_summary(peer_id);
+            log::info!(
+                "[Swarm event] Identify received from peer {}. observed_addr={:?}, listen_addrs={:?}, protocols={:?}, current summary={}",
+                peer_id,
+                observed_addr,
+                info.listen_addrs,
+                info.protocols,
+                summary.log_line()
+            );
+
+            if summary.is_relay_only()
+                && info
+                    .listen_addrs
+                    .iter()
+                    .any(|addr| !addr.to_string().contains("/p2p-circuit"))
+            {
+                swarm_control
+                    .best_effort_direct_upgrade_dial(peer_id, "identify_received")
+                    .await;
+            }
+        }
+        other => {
+            log::debug!("[Swarm event] Identify {other:?}");
+        }
+    }
+}
+
+fn handle_dcutr_behaviour_event(event: dcutr::Event) {
+    log::info!("[Swarm event] DCUtR {event:?}");
 }
 
 fn handle_relay_behaviour_event(event: relay::client::Event) {
@@ -796,6 +1060,13 @@ fn handle_outgoing_connection_error(
     peer_id: PeerId,
     error: DialError,
 ) {
+    let summary = swarm_control.peer_connection_summary(peer_id);
+    log::info!(
+        "Outgoing connection error for peer {}. Current summary before callback resolution: {}",
+        peer_id,
+        summary.log_line()
+    );
+
     if let Some(completer) = swarm_control
         .state()
         .dial_callback()
@@ -993,6 +1264,42 @@ async fn listen_relay_by_addr(swarm_control: SwarmControl, relay_addr: Multiaddr
         .await??;
 
     Ok(())
+}
+
+fn peer_connection_summary_from_state(state: &State, peer_id: PeerId) -> PeerConnectionSummary {
+    let Some(peer_connections) = state.get_peer_connections(&peer_id) else {
+        return PeerConnectionSummary::default();
+    };
+
+    let mut summary = PeerConnectionSummary::default();
+
+    for conn in peer_connections.outbound() {
+        summary.total_count += 1;
+        summary.outbound_count += 1;
+        let addr = conn.multiaddr().clone();
+        if addr.to_string().contains("/p2p-circuit") {
+            summary.relay_count += 1;
+            summary.relay_addrs.push(addr);
+        } else {
+            summary.direct_count += 1;
+            summary.direct_addrs.push(addr);
+        }
+    }
+
+    for conn in peer_connections.inbound() {
+        summary.total_count += 1;
+        summary.inbound_count += 1;
+        let addr = conn.multiaddr().clone();
+        if addr.to_string().contains("/p2p-circuit") {
+            summary.relay_count += 1;
+            summary.relay_addrs.push(addr);
+        } else {
+            summary.direct_count += 1;
+            summary.direct_addrs.push(addr);
+        }
+    }
+
+    summary
 }
 
 pub fn get_default_relay_addrs() -> Vec<Multiaddr> {
