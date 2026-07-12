@@ -38,7 +38,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-22.04'
@@ -49,6 +49,7 @@ jobs:
       - name: Install macOS dependencies
         if: startsWith(matrix.os, 'macos-')
         run: |
+          brew untap aws/tap || true
           brew install protobuf
 
       - name: Install Windows dependencies (NASM)

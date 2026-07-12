@@ -19,15 +19,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-15, windows-latest]
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
     
     - name: Set up Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        override: true
+      shell: bash
+      run: rustup update stable --no-self-update && rustup default stable
 
     - name: Install protobuf compiler
       shell: bash
@@ -36,13 +34,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
         elif [ "${{ runner.os }}" = "macOS" ]; then
+          brew untap aws/tap || true
           brew install protobuf
         elif [ "${{ runner.os }}" = "Windows" ]; then
           choco install protoc
         fi
 
     - name: Cache cargo registry
-      uses: actions/cache@v3
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           ~/.cargo/registry
@@ -52,7 +51,7 @@ jobs:
           ${{ runner.os }}-cargo-
 
     - name: Cache target folder
-      uses: actions/cache@v3
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: target
         key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
