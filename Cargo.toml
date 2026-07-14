@@ -46,6 +46,7 @@ percent-encoding = "2.3"
 prost = "0.14"
 rand = "0.8"
 reqwest = { version = "0.13", default-features = false }
+rustls = { version = "0.23", default-features = false }
 rustix = { version = "1.1.4", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -64,6 +65,7 @@ typed-path = "0.12"
 ulid = "1"
 void = "1"
 wasmtime-cli = "46.0.1"
+webpki-roots = "1"
 libp2p = { version = "0.56", features = [
     "macros",
     "noise",

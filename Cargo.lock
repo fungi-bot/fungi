@@ -1625,6 +1625,7 @@ dependencies = [
  "parking_lot",
  "rand 0.8.6",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1635,6 +1636,7 @@ dependencies = [
  "toml",
  "typed-path",
  "ulid",
+ "webpki-roots 1.0.8",
 ]
 
 [[package]]

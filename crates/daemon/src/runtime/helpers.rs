@@ -8,6 +8,8 @@ use fungi_config::paths::FungiPaths;
 use fungi_docker_agent::{ContainerSpec, DockerAgentError, PortProtocol};
 use tokio::process::Command;
 
+use crate::http_client::http_client;
+
 use super::{
     manifest::service_expose_endpoint_bindings, model::*, providers::WasmtimeServiceState,
 };
@@ -173,7 +175,9 @@ async fn stage_wasmtime_component(
             })?;
         }
         ServiceSource::WasmtimeUrl { url } => {
-            let response = reqwest::get(url)
+            let response = http_client()?
+                .get(url)
+                .send()
                 .await
                 .with_context(|| format!("Failed to download WASI component from {url}"))?
                 .error_for_status()

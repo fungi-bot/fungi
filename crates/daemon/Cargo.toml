@@ -42,5 +42,9 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 ulid = { workspace = true }
 
+[target.'cfg(target_os = "android")'.dependencies]
+rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
+webpki-roots = { workspace = true }
+
 [dev-dependencies]
 toml = { workspace = true }
