@@ -1,0 +1,85 @@
+name: Android Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["master"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  ANDROID_NDK_VERSION: "29.0.13846066"
+  CARGO_NDK_VERSION: "4.1.2"
+
+jobs:
+  android_runtime_test:
+    name: Rust tests on Android emulator
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Set up Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add x86_64-linux-android
+
+      - name: Cache Cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-android-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-android-cargo-
+
+      - name: Cache Android target folder
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/x86_64-linux-android
+          key: ${{ runner.os }}-android-x86_64-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-android-x86_64-target-
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version "$CARGO_NDK_VERSION" --locked
+
+      - name: Run Rust tests on Android
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 35
+          target: default
+          arch: x86_64
+          ndk: ${{ env.ANDROID_NDK_VERSION }}
+          emulator-options: >-
+            -no-window
+            -gpu swiftshader_indirect
+            -no-snapshot
+            -noaudio
+            -no-boot-anim
+            -no-metrics
+          script: |
+            adb devices
+            ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION" ANDROID_NDK_ROOT="$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION" ANDROID_NDK="$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION" cargo ndk -P 24 -t x86_64 test -p fungi-config --lib -- --nocapture
