@@ -10,6 +10,22 @@ pub fn daemon_lock_path(fungi_dir: &Path) -> PathBuf {
     fungi_dir.join(DAEMON_LOCK_FILE)
 }
 
+#[cfg(target_os = "android")]
+fn try_lock(file: &File) -> std::result::Result<(), TryLockError> {
+    use rustix::fs::{FlockOperation, flock};
+
+    match flock(file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(()),
+        Err(error) if error == rustix::io::Errno::WOULDBLOCK => Err(TryLockError::WouldBlock),
+        Err(error) => Err(TryLockError::Error(error.into())),
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn try_lock(file: &File) -> std::result::Result<(), TryLockError> {
+    file.try_lock()
+}
+
 pub struct DaemonInstanceLock {
     _file: File,
 }
@@ -31,7 +47,7 @@ impl DaemonInstanceLock {
             .open(&path)
             .with_context(|| format!("Failed to open daemon lock file: {}", path.display()))?;
 
-        match file.try_lock() {
+        match try_lock(&file) {
             Ok(()) => Ok(Self { _file: file }),
             Err(TryLockError::WouldBlock) => anyhow::bail!(
                 "Fungi daemon is already running for {}",
