@@ -4,7 +4,9 @@ use anyhow::{Context as _, Result, bail};
 use fungi_config::recipe_cache::{RecipeCache, validate_asset_name};
 use serde::Deserialize;
 
-use crate::{peek_service_manifest_name, service_manifest_with_instance_name};
+use crate::{
+    http_client::http_client, peek_service_manifest_name, service_manifest_with_instance_name,
+};
 
 const OFFICIAL_RECIPE_SOURCE_LABEL: &str = "enbop/fungi-service-recipes";
 const OFFICIAL_RECIPE_LATEST_RELEASE_URL: &str =
@@ -237,14 +239,18 @@ async fn load_official_recipe_index(
 }
 
 async fn refresh_latest_official_recipe_index(cache: &RecipeCache) -> Result<String> {
-    let latest_release_response = reqwest::get(OFFICIAL_RECIPE_LATEST_RELEASE_URL)
+    let latest_release_response = http_client()?
+        .get(OFFICIAL_RECIPE_LATEST_RELEASE_URL)
+        .send()
         .await
         .context("failed to resolve latest official recipe release")?
         .error_for_status()
         .context("latest official recipe release request failed")?;
     let release_version = release_version_from_release_page_url(latest_release_response.url())?;
 
-    let response = reqwest::get(release_asset_url(&release_version, "index.json")?)
+    let response = http_client()?
+        .get(release_asset_url(&release_version, "index.json")?)
+        .send()
         .await
         .context("failed to fetch official recipe index")?
         .error_for_status()
@@ -273,7 +279,9 @@ async fn ensure_cached_asset(
         return Ok(path);
     }
 
-    let response = reqwest::get(release_asset_url(release_version, asset_name)?)
+    let response = http_client()?
+        .get(release_asset_url(release_version, asset_name)?)
+        .send()
         .await
         .with_context(|| format!("failed to fetch recipe asset `{asset_name}`"))?
         .error_for_status()

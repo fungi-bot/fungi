@@ -1,6 +1,7 @@
 mod api;
 mod controls;
 mod daemon;
+mod http_client;
 mod node_capabilities;
 mod recipes;
 pub mod runtime;
