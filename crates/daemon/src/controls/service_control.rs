@@ -19,6 +19,10 @@ use crate::{
 };
 
 const MAX_CONTROL_FRAME_LEN: usize = 2 * 1024 * 1024;
+pub const DEFAULT_REMOTE_SERVICE_LOG_TAIL: usize = 200;
+pub const MAX_REMOTE_SERVICE_LOG_TAIL: usize = 2_000;
+const MAX_REMOTE_SERVICE_LOG_BYTES: usize = 512 * 1024;
+const REMOTE_LOG_TRUNCATION_NOTICE: &str = "[fungi] remote log output truncated\n";
 
 #[derive(Clone)]
 pub struct ServiceControlProtocolControl {
@@ -89,6 +93,23 @@ impl ServiceControlProtocolControl {
         self.send_request(
             peer_id,
             ServiceControlRequest::ListServices { request_id: None },
+        )
+        .await
+    }
+
+    pub async fn get_peer_service_logs(
+        &self,
+        peer_id: PeerId,
+        service: String,
+        tail: usize,
+    ) -> Result<ServiceControlResponse> {
+        self.send_request(
+            peer_id,
+            ServiceControlRequest::GetServiceLogs {
+                request_id: None,
+                service,
+                tail: tail.clamp(1, MAX_REMOTE_SERVICE_LOG_TAIL),
+            },
         )
         .await
     }
@@ -257,6 +278,28 @@ impl ServiceControlProtocolControl {
                     Err(error) => Err(error),
                 }
             }
+            ServiceControlRequest::GetServiceLogs { service, tail, .. } => {
+                let tail = tail.clamp(1, MAX_REMOTE_SERVICE_LOG_TAIL);
+                match self
+                    .runtime_control
+                    .logs_by_name(
+                        &service,
+                        &crate::ServiceLogsOptions {
+                            tail: Some(tail.to_string()),
+                        },
+                    )
+                    .await
+                {
+                    Ok(logs) => {
+                        return ServiceControlResponse::success_logs(
+                            request_id,
+                            service,
+                            limit_remote_log_text(logs.text),
+                        );
+                    }
+                    Err(error) => Err(error),
+                }
+            }
             ServiceControlRequest::StartService { service, .. } => {
                 match self.runtime_control.start_by_name(&service).await {
                     Ok(()) => match self
@@ -358,6 +401,19 @@ impl ServiceControlProtocolControl {
     }
 }
 
+fn limit_remote_log_text(text: String) -> String {
+    if text.len() <= MAX_REMOTE_SERVICE_LOG_BYTES {
+        return text;
+    }
+
+    let retained_bytes = MAX_REMOTE_SERVICE_LOG_BYTES - REMOTE_LOG_TRUNCATION_NOTICE.len();
+    let mut start = text.len() - retained_bytes;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{REMOTE_LOG_TRUNCATION_NOTICE}{}", &text[start..])
+}
+
 async fn write_frame<S, T>(stream: &mut S, value: &T) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -409,4 +465,25 @@ where
         .map_err(|e| anyhow::anyhow!("Failed to read frame payload: {e}"))?;
     serde_json::from_slice(&payload)
         .map_err(|e| anyhow::anyhow!("Failed to decode service-control frame: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_log_text_is_limited_from_the_front_at_a_character_boundary() {
+        let text = format!("discarded\n{}", "界".repeat(MAX_REMOTE_SERVICE_LOG_BYTES));
+
+        let limited = limit_remote_log_text(text);
+
+        assert!(limited.starts_with(REMOTE_LOG_TRUNCATION_NOTICE));
+        assert!(limited.ends_with('界'));
+        assert!(limited.len() <= MAX_REMOTE_SERVICE_LOG_BYTES);
+    }
+
+    #[test]
+    fn short_remote_log_text_is_unchanged() {
+        assert_eq!(limit_remote_log_text("hello\n".to_string()), "hello\n");
+    }
 }
