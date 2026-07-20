@@ -1478,7 +1478,7 @@ async fn attach_access_with_options(
                 Err(error) => fatal(format!("Failed to decode local address: {error}")),
             }
         }
-        Err(error) => fatal_grpc(error),
+        Err(error) => fatal_remote_device_grpc(error),
     }
 }
 
@@ -3061,11 +3061,15 @@ mod tests {
     fn connection_failures_use_the_short_user_message() {
         let unreachable =
             "Failed to open service-control stream: No connections available to peer abc";
+        let attach_refresh_failed = tonic::Status::internal(
+            "Failed to attach service access: failed to refresh remote service before attaching access",
+        );
 
         assert_eq!(
             user_facing_remote_device_error(unreachable),
             REMOTE_DEVICE_CONNECTION_MESSAGE
         );
+        assert!(is_remote_device_reachability_error(&attach_refresh_failed));
         assert_eq!(
             user_facing_remote_device_error("remote service not found: demo"),
             "remote service not found: demo"
