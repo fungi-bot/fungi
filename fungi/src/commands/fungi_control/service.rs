@@ -32,6 +32,9 @@ use super::{
     },
 };
 
+const REMOTE_DEVICE_CONNECTION_MESSAGE: &str =
+    "Could not connect to this device. It may be offline or may not trust this device.";
+
 type RpcClient = fungi_daemon_grpc::fungi_daemon_grpc::fungi_daemon_client::FungiDaemonClient<
     tonic::transport::Channel,
 >;
@@ -299,7 +302,7 @@ pub async fn execute_service(args: CommonArgs, service_args: ServiceArgs) {
                         print_remote_service_result("started", resp.into_inner());
                         refresh_remote_device_services(&mut client, &device.peer_id).await;
                     }
-                    Err(error) => fatal_grpc(error),
+                    Err(error) => fatal_remote_device_grpc(error),
                 }
             } else {
                 let req = ServiceNameRequest {
@@ -364,7 +367,7 @@ pub async fn execute_service(args: CommonArgs, service_args: ServiceArgs) {
                         print_remote_service_result("stopped", resp.into_inner());
                         refresh_remote_device_services(&mut client, &device.peer_id).await;
                     }
-                    Err(error) => fatal_grpc(error),
+                    Err(error) => fatal_remote_device_grpc(error),
                 }
             } else {
                 let req = ServiceNameRequest {
@@ -444,7 +447,7 @@ pub async fn execute_service(args: CommonArgs, service_args: ServiceArgs) {
                                 }
                             }
                         }
-                        fatal_grpc(error)
+                        fatal_remote_device_grpc(error)
                     }
                 }
             } else {
@@ -845,13 +848,13 @@ async fn apply_service_from_recipe(
                     };
                     match client.remote_start_service(Request::new(req)).await {
                         Ok(resp) => print_remote_service_result("started", resp.into_inner()),
-                        Err(error) => fatal_grpc(error),
+                        Err(error) => fatal_remote_device_grpc(error),
                     }
                 }
                 refresh_remote_device_services(client, &device.peer_id).await;
                 print_remote_apply_next_steps(&service_name, &device, start);
             }
-            Err(error) => fatal_grpc(error),
+            Err(error) => fatal_remote_device_grpc(error),
         }
     } else {
         print_recipe_runtime_wait_notice(&detail);
@@ -1058,13 +1061,13 @@ async fn apply_created_service(
                     };
                     match client.remote_start_service(Request::new(req)).await {
                         Ok(resp) => print_remote_service_result("started", resp.into_inner()),
-                        Err(error) => fatal_grpc(error),
+                        Err(error) => fatal_remote_device_grpc(error),
                     }
                 }
                 refresh_remote_device_services(client, &device.peer_id).await;
                 print_remote_apply_next_steps(&applied_service_name, &device, created.start_now);
             }
-            Err(error) => fatal_grpc(error),
+            Err(error) => fatal_remote_device_grpc(error),
         }
     } else {
         let req = PullServiceRequest {
@@ -1178,20 +1181,44 @@ fn print_remote_service_result(action: &str, resp: RemoteServiceControlResponse)
 }
 
 fn is_remote_device_reachability_error(error: &tonic::Status) -> bool {
-    let message = error.message();
+    is_remote_device_connection_error_message(error.message())
+}
+
+fn is_remote_device_connection_error_message(message: &str) -> bool {
     message.contains("Failed to open service-control stream")
         || message.contains("Failed to write service-control request")
         || message.contains("Failed to read service-control response")
         || message.contains("No connections available to peer")
+        || message.contains("connection is closed")
+        || message.contains("Connection reset by peer")
+        || message.contains("unexpected end of file")
+        || message.contains("failed to refresh remote service before attaching access")
+}
+
+fn user_facing_remote_device_error(message: &str) -> &str {
+    if is_remote_device_connection_error_message(message) {
+        REMOTE_DEVICE_CONNECTION_MESSAGE
+    } else {
+        message
+    }
+}
+
+fn fatal_remote_device_message(message: &str) -> ! {
+    fatal(user_facing_remote_device_error(message))
+}
+
+fn fatal_remote_device_grpc(error: tonic::Status) -> ! {
+    if is_remote_device_reachability_error(&error) {
+        fatal(REMOTE_DEVICE_CONNECTION_MESSAGE)
+    }
+    fatal_grpc(error)
 }
 
 async fn refresh_remote_device_services(client: &mut RpcClient, peer_id: &str) {
     match fetch_device_service_snapshot(client, peer_id, true).await {
         Ok(snapshot) => {
-            if let Some(error) = snapshot.error {
-                eprintln!(
-                    "Warning: failed to refresh device service snapshot; using cached data: {error}"
-                );
+            if snapshot.error.is_some() {
+                eprintln!("Warning: {REMOTE_DEVICE_CONNECTION_MESSAGE}");
             }
         }
         Err(error) => {
@@ -1288,6 +1315,9 @@ fn add_remote_service_overview_rows(
             rows.push(ServiceOverviewRow::remote_unavailable(device, error));
         }
         Ok(snapshot) => {
+            if snapshot.error.is_some() {
+                eprintln!("Warning: {REMOTE_DEVICE_CONNECTION_MESSAGE}");
+            }
             add_cached_remote_service_overview_rows(
                 rows,
                 device,
@@ -1398,13 +1428,18 @@ async fn inspect_remote_service(
     name: String,
 ) -> RemoteService {
     match fetch_device_service_snapshot(client, peer_id, true).await {
-        Ok(snapshot) => snapshot
-            .snapshot
-            .services
-            .into_iter()
-            .find(|service| service.name == name)
-            .unwrap_or_else(|| fatal(format!("Remote service not found: {name}"))),
-        Err(error) => fatal(error),
+        Ok(snapshot) => {
+            if snapshot.error.is_some() {
+                fatal(REMOTE_DEVICE_CONNECTION_MESSAGE);
+            }
+            snapshot
+                .snapshot
+                .services
+                .into_iter()
+                .find(|service| service.name == name)
+                .unwrap_or_else(|| fatal(format!("Remote service not found: {name}")))
+        }
+        Err(error) => fatal_remote_device_message(&error),
     }
 }
 
@@ -1419,7 +1454,7 @@ async fn list_accesses(client: &mut RpcClient, peer_id: &str) -> Vec<ServiceAcce
             Ok(accesses) => accesses,
             Err(error) => fatal(format!("Failed to decode access list: {error}")),
         },
-        Err(error) => fatal_grpc(error),
+        Err(error) => fatal_remote_device_grpc(error),
     }
 }
 
@@ -1443,7 +1478,7 @@ async fn attach_access_with_options(
                 Err(error) => fatal(format!("Failed to decode local address: {error}")),
             }
         }
-        Err(error) => fatal_grpc(error),
+        Err(error) => fatal_remote_device_grpc(error),
     }
 }
 
@@ -1455,8 +1490,12 @@ async fn discover_remote_service(
 ) -> RemoteService {
     let snapshot = match fetch_device_service_snapshot(client, peer_id, true).await {
         Ok(snapshot) => snapshot,
-        Err(error) => fatal(error),
+        Err(error) => fatal_remote_device_message(&error),
     };
+
+    if snapshot.error.is_some() {
+        fatal(REMOTE_DEVICE_CONNECTION_MESSAGE);
+    }
 
     if let Some(service) = snapshot
         .snapshot
@@ -3016,6 +3055,25 @@ mod tests {
 
         assert!(is_remote_device_reachability_error(&unreachable));
         assert!(!is_remote_device_reachability_error(&execution_failed));
+    }
+
+    #[test]
+    fn connection_failures_use_the_short_user_message() {
+        let unreachable =
+            "Failed to open service-control stream: No connections available to peer abc";
+        let attach_refresh_failed = tonic::Status::internal(
+            "Failed to attach service access: failed to refresh remote service before attaching access",
+        );
+
+        assert_eq!(
+            user_facing_remote_device_error(unreachable),
+            REMOTE_DEVICE_CONNECTION_MESSAGE
+        );
+        assert!(is_remote_device_reachability_error(&attach_refresh_failed));
+        assert_eq!(
+            user_facing_remote_device_error("remote service not found: demo"),
+            "remote service not found: demo"
+        );
     }
 
     #[test]

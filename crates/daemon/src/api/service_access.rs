@@ -102,6 +102,9 @@ impl FungiDaemon {
         local_port: Option<u16>,
     ) -> Result<ServiceAccess> {
         let snapshot = self.get_device_service_snapshot(peer_id, true).await?;
+        if let Some(error) = snapshot.error {
+            bail!("failed to refresh remote service before attaching access: {error}");
+        }
         let service = snapshot
             .snapshot
             .services
@@ -712,6 +715,44 @@ mod tests {
             .map(|(_, rule)| rule.local_port)
             .collect::<Vec<_>>();
         assert_eq!(active_ports, vec![second_local_port]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attach_rejects_cached_snapshot_when_live_refresh_fails() -> Result<()> {
+        let service_name = "cached-only";
+        let (client, server) =
+            setup_access_test_pair(service_name, vec![("main", free_tcp_port()?)]).await?;
+        let peer_id = server.peer_id();
+
+        client
+            .daemon()
+            .attach_service_access(
+                peer_id,
+                service_name.to_string(),
+                Some("main".to_string()),
+                None,
+            )
+            .await?;
+
+        server.daemon().untrust_device(client.peer_id())?;
+
+        let error = client
+            .daemon()
+            .attach_service_access(
+                peer_id,
+                service_name.to_string(),
+                Some("main".to_string()),
+                None,
+            )
+            .await
+            .expect_err("cached service metadata must not make an unavailable service attachable");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to refresh remote service before attaching access")
+        );
         Ok(())
     }
 
